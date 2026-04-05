@@ -1,0 +1,20 @@
+services:
+  mt5:
+    image: boris2015/mt5:latest
+    # container_name: mt5
+    restart: unless-stopped
+
+    environment:
+      - CUSTOM_USER=${VNC_USER}
+      - PASSWORD=${VNC_PASSWORD}
+      - MT5_LOGIN=${MT5_LOGIN}
+      - MT5_PASSWORD=${MT5_PASSWORD}
+      - MT5_SERVER=${MT5_SERVER}
+
+    volumes:
+      - ./config:/config
+      # - servers.dat:/fix/servers.dat:ro if need to add new broker
+      # - config.ini:/fix/config.ini:ro if need to use config.ini file
+    ports:
+      - "3000:3000"
+      - "8001:8001"
