@@ -1,4 +1,3 @@
-# rpyc_server.py
 import os
 import sys
 import time
@@ -64,38 +63,34 @@ def _get_nth_weekday(year: int, month: int, weekday: int, n: int) -> datetime.da
 
 def _get_reference_fridays(
     now: datetime.datetime,
-) -> tuple[tuple[datetime.date, datetime.datetime], tuple[datetime.date, datetime.datetime]]:
-    """
-    Retourne deux références (vendredi, 16:00 NY en UTC) :
-    - 3ème vendredi janvier → plein hiver garanti
-    - 3ème vendredi juillet → plein été garanti
-
-    Postulat : 16:00 NY = ouverture dernière bougie H1 avant fermeture Forex.
-    pytz gère EST (UTC-5) / EDT (UTC-4) automatiquement selon la date.
-
-    Si le vendredi est dans le futur → année précédente.
-    """
-    year = now.year
+):
 
     def _resolve(month: int) -> tuple[datetime.date, datetime.datetime]:
-        friday = _get_nth_weekday(year, month, 4, 3)
-        if friday >= now.date():
-            friday = _get_nth_weekday(year - 1, month, 4, 3)
-        dt_utc = NY_TZ.localize(
-            datetime.datetime(friday.year, friday.month, friday.day, 16, 0)
-        ).astimezone(datetime.timezone.utc)
-        return friday, dt_utc
+        year = now.year
 
-    ref_winter = _resolve(1)   # janvier — plein hiver
-    ref_summer = _resolve(7)   # juillet — plein été
+        # Essayer jusqu'à 5 vendredis en arrière si férié
+        for attempt in range(5):
+            # Décaler d'une semaine en arrière à chaque tentative
+            week_offset = attempt
+            friday = _get_nth_weekday(year, month, 4, 3) - datetime.timedelta(weeks=week_offset)
 
-    print(
-        f"(ref) Vendredi hiver : {ref_winter[0]} "
-        f"16:00 NY = {ref_winter[1].strftime('%Y-%m-%d %H:%M')} UTC\n"
-        f"(ref) Vendredi été   : {ref_summer[0]} "
-        f"16:00 NY = {ref_summer[1].strftime('%Y-%m-%d %H:%M')} UTC",
-        file=sys.stderr
-    )
+            if friday >= now.date():
+                friday = _get_nth_weekday(year - 1, month, 4, 3) - datetime.timedelta(weeks=week_offset)
+
+            dt_utc = NY_TZ.localize(
+                datetime.datetime(friday.year, friday.month, friday.day, 16, 0)
+            ).astimezone(datetime.timezone.utc)
+
+            offset = _compute_offset_from_friday(friday, dt_utc)
+            if offset is not None:
+                return friday, dt_utc
+
+        # Ne devrait jamais arriver — 5 vendredis consécutifs fériés impossible
+        raise RuntimeError(f"Impossible de trouver un vendredi ouvré en mois {month}")
+
+    ref_winter = _resolve(1)
+    ref_summer = _resolve(7)
+
     return ref_winter, ref_summer
 
 
@@ -105,20 +100,10 @@ def _get_reference_fridays(
 
 def _compute_offset_from_friday(
     friday: datetime.date,
-    dt_utc: datetime.datetime,  # 16:00 NY → UTC via pytz
+    dt_utc: datetime.datetime,
 ):
-    """
-    Dernière bougie H1 du vendredi = forcément celle qui ouvre à 16:00 NY.
-    On demande depuis vendredi 23:59 naive (heure broker) count=1
-    → MT5 retourne la dernière bougie disponible ce vendredi
-    → broker_ts = rates[0]['time']
-    → utc_ts    = dt_utc.timestamp()  (16:00 NY → UTC, connu via pytz)
-    → offset    = broker_ts - utc_ts
-    """
     import MetaTrader5 as mt5
 
-    # 23:59 naive → MT5 l'interprète comme heure broker
-    # → retourne la dernière bougie H1 du vendredi quel que soit l'offset
     dt_search = datetime.datetime(
         friday.year, friday.month, friday.day, 23, 59
     )
@@ -128,19 +113,29 @@ def _compute_offset_from_friday(
         print(f"(warn) Aucune bougie pour vendredi {friday}", file=sys.stderr)
         return None
 
-    broker_ts    = int(rates[0]['time'])
+    broker_ts = int(rates[0]['time'])
+
+    # Vérifier que la bougie retournée est bien un vendredi
+    # broker_ts est en heure broker — convertir en date naive pour vérifier
+    dt_broker = datetime.datetime.utcfromtimestamp(broker_ts)
+    if dt_broker.weekday() != 4:  # 4 = vendredi
+        print(
+            f"(warn) Vendredi {friday} férié — "
+            f"bougie retournée = {dt_broker.strftime('%A %Y-%m-%d')} "
+            f"→ essayer vendredi précédent",
+            file=sys.stderr
+        )
+        return None  # ← signaler l'échec pour essayer un autre vendredi
+
     utc_ts       = int(dt_utc.timestamp())
     offset_hours = round((broker_ts - utc_ts) / 3600)
 
     print(
         f"(ok) Vendredi {friday} — "
-        f"broker_ts={broker_ts} "
-        f"utc_ts={utc_ts} "
-        f"offset=UTC+{offset_hours}h",
+        f"broker_ts={broker_ts} utc_ts={utc_ts} offset=UTC+{offset_hours}h",
         file=sys.stderr
     )
     return offset_hours
-
 
 # ─────────────────────────────────────────────────────────────
 #  Détection timezone
@@ -537,6 +532,8 @@ class MT5Service(rpyc.Service):
         return MT5Service._tz.zone
 
     def exposed_call(self, method_name: str, *args, **kwargs):
+        if method_name == "login":
+            return
         import MetaTrader5 as mt5
         self._check_drift()
 
@@ -581,6 +578,7 @@ class MT5Service(rpyc.Service):
                     "code":   mt5.last_error(),
                     "method": method_name,
                 }
+        
 
         return _serialize(result, MT5Service._trans_lookup, MT5Service._fixed_offset)
 
